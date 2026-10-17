@@ -98,6 +98,7 @@ public class MatViewState implements QuietCloseable {
             AtomicLongFieldUpdater.newUpdater(MatViewState.class, "refreshRetryAfterMicros");
     // Used to avoid concurrent refresh runs.
     private final AtomicBoolean latch = new AtomicBoolean(false);
+    private final AtomicLong lastNotifiedBaseTxn = new AtomicLong();
     // Protected by this.latch.
     // Holds cached txn intervals read from WAL transactions (_event files) of the base table.
     // Lets WalPurgeJob to make progress and delete applied WAL segments of a base table without
@@ -632,6 +633,10 @@ public class MatViewState implements QuietCloseable {
 
     public long getRefreshIntervalsBaseTxn() {
         return refreshIntervalsBaseTxn;
+    }
+
+    AtomicLong getLastNotifiedBaseTxn() {
+        return lastNotifiedBaseTxn;
     }
 
     public long getRefreshIntervalsSeq() {

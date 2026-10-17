@@ -1309,6 +1309,18 @@ public class MatViewRefreshJob implements Job, QuietCloseable {
         final long refreshTriggerTimestamp = refreshTask.refreshTriggerTimestamp;
         if (viewToken == null) {
             return refreshDependentViewsIncremental(baseTableToken, graph, stateStore, refreshTriggerTimestamp);
+        } else if (baseTableToken != null) {
+            final MatViewState viewState = stateStore.getViewState(viewToken);
+            if (viewState == null) {
+                return false;
+            }
+            final long notifiedTxn = Math.abs(viewState.getLastNotifiedBaseTxn().get());
+            try {
+                return refreshIncremental(viewToken, stateStore, refreshTriggerTimestamp);
+            } finally {
+                // Commits arriving during this view's refresh requeue only this view.
+                stateStore.notifyBaseRefreshed(refreshTask, notifiedTxn);
+            }
         } else {
             return refreshIncremental(viewToken, stateStore, refreshTriggerTimestamp);
         }
@@ -2184,15 +2196,8 @@ public class MatViewRefreshJob implements Job, QuietCloseable {
     ) {
         assert baseTableToken.isWal();
 
-        boolean refreshed = false;
         final SeqTxnTracker baseSeqTracker = engine.getTableSequencerAPI().getTxnTracker(baseTableToken);
-        // Safe floor: every view opens its reader after this sample, so each examines at least this txn.
         final long minRefreshToTxn = baseSeqTracker.getWriterTxn();
-        // The minimum base txn examined across the refreshed views. Acknowledging this instead of the
-        // pre-loop floor lets the clean/dirty handshake converge when the readable base txn advances
-        // between the floor sample and a view opening its reader, while never claiming the base is
-        // refreshed past what any view actually examined.
-        long minExaminedToTxn = Numbers.LONG_NULL;
 
         childViewSink.clear();
         graph.getDependentViews(baseTableToken, childViewSink);
@@ -2230,78 +2235,19 @@ public class MatViewRefreshJob implements Job, QuietCloseable {
                     continue;
                 }
 
-                if (!viewState.tryLock()) {
-                    LOG.debug().$("skipping materialized view refresh, locked by another refresh run [view=").$(viewToken).I$();
-                    stateStore.enqueueIncrementalRefresh(viewToken);
-                    continue;
-                }
-
-                try (WalWriter walWriter = engine.getWalWriter(viewToken)) {
-                    try {
-                        final long result = refreshIncremental0(baseTableToken, viewDefinition, viewState, walWriter, refreshTriggerTimestamp);
-                        refreshed |= (result & 1L) != 0;
-                        final long examinedBaseTxn = result >> 1;
-                        minExaminedToTxn = minExaminedToTxn != Numbers.LONG_NULL
-                                ? Math.min(minExaminedToTxn, examinedBaseTxn)
-                                : examinedBaseTxn;
-                    } catch (Throwable th) {
-                        // A demote that flips the read-only flag mid-refresh makes the commit fence refuse
-                        // from inside the pump; re-throw so the outer catch defers (retry-later) instead of
-                        // invalidating.
-                        rethrowReadOnlyRefusal(th);
-                        // Never arm a retry on an already-invalid view: a prior refreshFailState
-                        // (e.g. inside insertAsSelect) may have marked it invalid in-memory and then
-                        // had its WAL write (resetMatViewState) throw a retriable error that
-                        // propagates here. The isInvalid() short-circuit mirrors the outer catch's
-                        // !isInvalid() guard, so such a retriable error fails the state instead of
-                        // arming a retry on an invalid view.
-                        if (viewState.isInvalid() || !tryScheduleRetry(viewState, viewToken, th)) {
-                            refreshFailState(viewDefinition, viewState, walWriter, th);
-                        }
-                    }
-                } catch (Throwable th) {
-                    if (isTableSuspendedError(th)) {
-                        // The view was suspended between the isViewWriteSuspended gate and the getWalWriter
-                        // acquire. Skip without invalidating; resume re-triggers the refresh.
-                        LOG.info().$("skipping incremental refresh, materialized view is suspended [view=").$(viewToken).I$();
-                        continue;
-                    }
-                    if (handleErrorRetryRefresh(th, viewToken, stateStore, null)) {
-                        // Incremental refresh is re-scheduled.
-                        continue;
-                    }
-                    // Don't arm a retry on a view that a prior refreshFailState already marked invalid
-                    // in-memory (e.g. its WAL write threw a retriable error after refreshFail ran): the
-                    // retry would be scheduled on an already-invalid view and only dropped later by the
-                    // timer job's isInvalid() guard, after needlessly bumping the retry counter.
-                    if (!viewState.isInvalid() && tryScheduleRetry(viewState, viewToken, th)) {
-                        // The view's WAL writer pool was exhausted; retry later instead of invalidating.
-                        continue;
-                    }
-                    // If we're here, we either couldn't obtain the WAL writer or the writer couldn't write
-                    // invalid state transaction. Update the in-memory state and call it a day.
-                    LOG.error()
-                            .$("could not perform incremental refresh, unexpected error [view=").$(viewToken)
-                            .$(", ex=").$(th)
-                            .I$();
-                    refreshFailState(viewDefinition, viewState, null, th);
-                } finally {
-                    finalizeAndUnlock(viewToken, viewState, true);
-                }
+                // Dispatch siblings independently; a slow refresh must not hold up the others.
+                refreshTask.clear();
+                refreshTask.baseTableToken = baseTableToken;
+                refreshTask.matViewToken = viewToken;
+                refreshTask.operation = MatViewRefreshTask.INCREMENTAL_REFRESH;
+                stateStore.notifyBaseTableCommit(refreshTask, minRefreshToTxn);
             }
         }
         refreshTask.clear();
         refreshTask.baseTableToken = baseTableToken;
         refreshTask.operation = MatViewRefreshTask.INCREMENTAL_REFRESH;
-        // Fall back to the pre-loop floor when no view was refreshed (e.g. all skipped or timer-only).
-        final long refreshedToTxn = minExaminedToTxn != Numbers.LONG_NULL ? minExaminedToTxn : minRefreshToTxn;
-        stateStore.notifyBaseRefreshed(refreshTask, refreshedToTxn);
-
-        if (refreshed) {
-            LOG.info().$("refreshed materialized views dependent on [baseTable=").$(baseTableToken)
-                    .$(", lastSeqTxn=").$(refreshedToTxn).I$();
-        }
-        return refreshed;
+        stateStore.notifyBaseRefreshed(refreshTask, minRefreshToTxn);
+        return false;
     }
 
     private void refreshFailState(
@@ -2398,15 +2344,14 @@ public class MatViewRefreshJob implements Job, QuietCloseable {
             }
 
             try {
-                // The examined base txn is only needed when refreshing dependent views; here we just
-                // return the "refreshed" flag from bit 0.
+                // Return the "refreshed" flag from the packed result.
                 final long result = refreshIncremental0(baseTableToken, viewDefinition, viewState, walWriter, refreshTriggerTimestamp);
                 return (result & 1L) != 0;
             } catch (Throwable th) {
                 // A demote that flips the read-only flag mid-refresh makes the commit fence refuse from
                 // inside the pump; re-throw so the outer catch defers (retry-later) instead of invalidating.
                 rethrowReadOnlyRefusal(th);
-                // Never arm a retry on an already-invalid view (see refreshDependentViewsIncremental):
+                // Never arm a retry on an already-invalid view:
                 // a prior refreshFailState inside insertAsSelect may have marked it invalid in-memory
                 // and then had its WAL write (resetMatViewState) throw a retriable error that
                 // propagates here. The !isInvalid() guard mirrors the outer catch.
@@ -2455,10 +2400,8 @@ public class MatViewRefreshJob implements Job, QuietCloseable {
     }
 
     // Returns a packed long: the examined base table txn (the reader's seqTxn) in bits 63..1 and the
-    // "refreshed" flag in bit 0. The examined txn lets refreshDependentViewsIncremental() acknowledge
-    // only the base txn that was actually examined. Every non-throwing return opens the reader first,
-    // so the examined txn is always valid; the txn-sanity throw below is handled by the caller without
-    // reading the result.
+    // "refreshed" flag in bit 0. Per-view notification acknowledgement uses the requested txn sampled
+    // before the refresh, so commits arriving during the refresh trigger another pass.
     private long refreshIncremental0(
             @NotNull TableToken baseTableToken,
             @NotNull MatViewDefinition viewDefinition,

@@ -298,7 +298,7 @@ public class MatViewStateStoreImpl implements MatViewStateStore {
 
     @Override
     public void notifyBaseRefreshed(MatViewRefreshTask task, long seqTxn) {
-        final AtomicLong lastNotifiedTxn = lastNotifiedTxnByTableName.get(task.baseTableToken.getTableName());
+        final AtomicLong lastNotifiedTxn = getLastNotifiedTxn(task);
         if (lastNotifiedTxn != null && notifyOnBaseTableRefreshed(lastNotifiedTxn, seqTxn)) {
             // While refreshing more txn were committed. Refresh will need to re-run.
             task.refreshTriggerTimestamp = microsecondClock.getTicks();
@@ -309,7 +309,7 @@ public class MatViewStateStoreImpl implements MatViewStateStore {
     @Override
     public void notifyBaseTableCommit(MatViewRefreshTask task, long seqTxn) {
         final TableToken baseTableToken = task.baseTableToken;
-        final AtomicLong lastNotifiedBaseTableTxn = lastNotifiedTxnByTableName.get(baseTableToken.getTableName());
+        final AtomicLong lastNotifiedBaseTableTxn = getLastNotifiedTxn(task);
         task.refreshTriggerTimestamp = microsecondClock.getTicks();
         // Always notify refresh job in case of mat view invalidation or full refresh.
         if (task.operation != MatViewRefreshTask.INCREMENTAL_REFRESH) {
@@ -510,6 +510,14 @@ public class MatViewStateStoreImpl implements MatViewStateStore {
             final MatViewTimerTask timerTask = tlTimerTask.get();
             timerTaskQueue.enqueue(timerTask.ofUpdate(matViewToken));
         }
+    }
+
+    private AtomicLong getLastNotifiedTxn(MatViewRefreshTask task) {
+        if (task.matViewToken != null) {
+            final MatViewState state = getViewState(task.matViewToken);
+            return state != null ? state.getLastNotifiedBaseTxn() : null;
+        }
+        return lastNotifiedTxnByTableName.get(task.baseTableToken.getTableName());
     }
 
     private void enqueueInvalidate0(
